@@ -1,3 +1,5 @@
+Lab1:
+
 Task_1: Press the button to trigger LED2 blinking (keep blinking in 5s with 1Hz frequency).
 
 Hint: The EXTI interrupt handler detects the button press and then inform Task_1 via a binary semaphore to blink LED.
