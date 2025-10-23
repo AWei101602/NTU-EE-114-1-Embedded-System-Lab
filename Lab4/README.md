@@ -10,4 +10,5 @@ p.s. the 3-axis acceleration values should be real data sampled from LSM6DSM ins
 =================
 
 ====option problem_1==== (plus 5 points)
+
 Use another STM32 board. Replace the RPi client with STM32 client.
