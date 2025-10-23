@@ -1,3 +1,6 @@
+NOT FINISHED YET
+
+
 STM32Cubeide BLE programming – Peripheral (GATT server) in STM32 IoT node and Central (GATT client) in Python (RPi)
 
 ====basic problem====
