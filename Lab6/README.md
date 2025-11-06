@@ -2,7 +2,7 @@
 Please setup ADC (ADC1) triggered by timer (TIM1) to sample the signal of STM32 internal temperature sensor at a fixed frequency and generating an interrupt when each conversion finishes. You have to determine the trigger frequency (explain to TA what the parameters you set), and interrupts should inform the RTOS task to print the sensor values out through UART.
 請同學用cubeIDE進行設定，請參考助教 demo 以及網路資源，例如:
 https://refcircuit.com/articles/21-get-temperature-from-stm32-internal-temperature-sensor-simple-library.htmlLinks to an external site.
-https://github.com/Egoruch/Internal-Temperature-Sensor-STM32-HAL/tree/mainLinks to an external site.
+https://github.com/Egoruch/Internal-Temperature-Sensor-STM32-HAL/tree/mainLinks
 
  
 
