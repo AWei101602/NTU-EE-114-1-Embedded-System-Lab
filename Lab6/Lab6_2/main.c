@@ -183,30 +183,15 @@ TransEvent_t trans_flag;
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
 	//to do: inform RTOS task to print out sensor data
-	/*int i;
-		for (i = SAMPLE_BUFFER_SIZE/ 2; i < SAMPLE_BUFFER_SIZE ; ++i)
-			printf("%d ", sample_buffer[i]);
-
-	printf("\r\n");*/
-	printf("Yes01\r\n");
 	trans_flag = BUFFER_BOTTOM_HALF_FULL;
-	printf("Flag is %d\r\n", trans_flag);
 	osMessageQueuePut(myQueue01Handle, &trans_flag, 0U, 0U);
 }
 
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 {
     	//to do: inform RTOS task to print out sensor data
-	/*int i;
-	for (i = 0; i < SAMPLE_BUFFER_SIZE/ 2 ; ++i)
-		printf("%d ", sample_buffer[i]);
-
-	printf("\r\n");*/
-	printf("Yes02\r\n");
 	trans_flag = BUFFER_TOP_HALF_FULL;
-	printf("Flag is %d\r\n", trans_flag);
 	osMessageQueuePut(myQueue01Handle, &trans_flag, 0U, 0U);
-	printf("Yes12\r\n");
 }
 
 
@@ -927,7 +912,6 @@ void StartDefaultTask(void *argument)
         /* 等待 ADC callback 傳來訊號 */
         if (osMessageQueueGet(myQueue01Handle, &flag, NULL, osWaitForever) == osOK)
         {
-        	printf("Flag is %d\r\n", flag);
             if (flag == BUFFER_TOP_HALF_FULL)
             {
                 for (int i = 0; i < SAMPLE_BUFFER_SIZE / 2; ++i)
