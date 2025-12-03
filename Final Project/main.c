@@ -18,9 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "cmsis_os.h"
 #include "stdio.h"
-#include "core_cm4.h"
+#include "stdbool.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -28,11 +27,47 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct {
+    // --- 中斷與計時變數 (Volatile 因為在中斷內修改) ---
+    volatile uint32_t start_tick; // Echo 上升緣時間點 (Timer Count)
+    volatile uint32_t end_tick;   // Echo 下降緣時間點
+    volatile bool is_measuring;   // 標記：是否正在等待回波
 
+    // --- 輸出結果變數 ---
+    volatile float distance;      // 最新計算距離 (cm)
+    volatile uint8_t valid;       // 數據狀態 (1:有效, 0:更新中/無效)
+} Ultrasonic_t;
+typedef enum {
+    ZONE_NONE = 0,
+    ZONE_LEFT,
+    ZONE_CENTER,
+    ZONE_RIGHT
+} Zone_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// 1. 左側 (Left) - Trig:D2(PD14), Echo:D3(PB0->EXTI0)
+#define L_TRIG_PORT GPIOD
+#define L_TRIG_PIN  GPIO_PIN_14
+#define L_ECHO_PORT GPIOB
+#define L_ECHO_PIN  GPIO_PIN_0
+
+// 2. 中間 (Center) - Trig:D4(PA3), Echo:D5(PB4->EXTI4)
+#define C_TRIG_PORT GPIOA
+#define C_TRIG_PIN  GPIO_PIN_3
+#define C_ECHO_PORT GPIOB
+#define C_ECHO_PIN  GPIO_PIN_4
+
+// 3. 右側 (Right) - Trig:D6(PB1), Echo:D8(PB2->EXTI2) [關鍵修改]
+#define R_TRIG_PORT GPIOB
+#define R_TRIG_PIN  GPIO_PIN_1
+#define R_ECHO_PORT GPIOB
+#define R_ECHO_PIN  GPIO_PIN_2
+
+// --- 邏輯參數 ---
+#define DETECT_THRESHOLD  80.0f  // 偵測門檻 (cm)，超過這個距離視為沒人
+#define MOVE_HYSTERESIS   5.0f   // 移動判斷的遲滯/最小變化量 (cm)
 
 /* USER CODE END PD */
 
@@ -57,21 +92,20 @@ UART_HandleTypeDef huart3;
 
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
-/* Definitions for defaultTask */
-osThreadId_t defaultTaskHandle;
-const osThreadAttr_t defaultTask_attributes = {
-  .name = "defaultTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
 /* USER CODE BEGIN PV */
-#define TRIG_PIN  GPIO_PIN_1	//PA1 TRIG
-#define TRIG_PORT GPIOA			//PA1 TRIG
-#define ECHO_PIN  GPIO_PIN_0 	//PA0 ECHO
-#define ECHO_PORT GPIOA      	//PA0 ECHO
-uint32_t t_start = 0, t_end = 0;
-uint8_t capture_status = 0;   // 0: 等待上升沿，1: 已捕獲上升沿，等待下降沿
-float Distance = 0.0f;
+Ultrasonic_t us_L = {0};
+Ultrasonic_t us_C = {0};
+Ultrasonic_t us_R = {0};
+
+// 任務排程器變數
+uint8_t current_sensor_idx = 0; // 目前輪到的感測器 (0:L, 1:C, 2:R)
+uint8_t measure_step = 0;       // 狀態機步驟 (0:發射, 1:等待, 2:切換)
+uint32_t last_process_tick = 0; // 用於控制測量間隔與超時
+
+Zone_t current_zone = ZONE_NONE;
+Zone_t last_zone = ZONE_NONE;
+float last_min_distance = 0.0f;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -85,74 +119,274 @@ static void MX_USART1_UART_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
 static void MX_TIM2_Init(void);
-void StartDefaultTask(void *argument);
-
 /* USER CODE BEGIN PFP */
-int _write(int file, char *ptr, int len)
+//int _write(int file, char *ptr, int len)
+//{
+//    HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, 10);
+//    return len;
+//}
+#ifdef __GNUC__
+int __io_putchar(int ch)
+#else
+int fputc(int ch, FILE *f)
+#endif
 {
-    HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, 10);
-    return len;
+    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 0xFFFF);
+    return ch;
 }
 
-__STATIC_INLINE void delay_us(uint32_t us){
-	uint32_t start = DWT->CYCCNT;
-	uint32_t cycles = us*(SystemCoreClock / 1000000);
-	while( (DWT->CYCCNT - start) < cycles);
-
+void delay_us_short(uint16_t us) {
+    __HAL_TIM_SET_COUNTER(&htim2, 0);
+    while (__HAL_TIM_GET_COUNTER(&htim2) < us);
 }
-void HC_SR04_Trigger(void){
-	HAL_GPIO_WritePin(TRIG_PORT,TRIG_PIN,GPIO_PIN_RESET);
-	delay_us(5);
-	HAL_GPIO_WritePin(TRIG_PORT,TRIG_PIN,GPIO_PIN_SET);
-	delay_us(12);
-	HAL_GPIO_WritePin(TRIG_PORT,TRIG_PIN,GPIO_PIN_RESET);
+
+// --- 發送 Trigger 脈衝訊號 ---
+void US_Trigger(GPIO_TypeDef* port, uint16_t pin) {
+    HAL_GPIO_WritePin(port, pin, GPIO_PIN_SET);
+    delay_us_short(10); // 維持 10us High
+    HAL_GPIO_WritePin(port, pin, GPIO_PIN_RESET);
 }
-void Calculate_Distance(uint32_t pulse_width_us)
-{
-    // 音速約為 34300 cm/s (340 m/s)，即 0.0343 cm/µs
-    // 超音波來回一次，實際距離需除以 2
-    Distance = (float)pulse_width_us * 0.0343f / 2.0f;
 
-    printf("Pulse: %lu us, Distance: %.2f cm\r\n", pulse_width_us, Distance);
-}
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
-{
+/**
+ * @brief 讀取 HC-SR04 距離 (含完整除錯機制)
+ * @return float: 距離 (cm), 錯誤代碼: -1.0 (等不到回波), -2.0 (回波過長/卡死), -3.0 (觸發前線路異常)
+ */
+//float HCSR04_Read(void) {
+//    uint32_t pMillis;
+//    uint32_t val1 = 0;
+//    uint32_t val2 = 0;
+//    uint32_t pWidth = 0;
+//
+//    // --- 步驟 0: 檢查感測器狀態 (Pre-check) ---
+//    // 在發送訊號前，Echo 應該要是 Low。如果是 High，代表線路浮接、接錯或感測器當機。
+//    if (HAL_GPIO_ReadPin(ECHO_PORT, ECHO_PIN) == GPIO_PIN_SET) {
+//        printf("Error: Echo is already HIGH before trigger! (Check Wiring or Pull-down)\r\n");
+//        return -3.0;
+//    }
+//
+//    // --- 步驟 1: 發送 Trigger 訊號 ---
+//    HAL_GPIO_WritePin(TRIG_PORT, TRIG_PIN, GPIO_PIN_SET);
+//    delay_us(10);
+//    HAL_GPIO_WritePin(TRIG_PORT, TRIG_PIN, GPIO_PIN_RESET);
+//
+//    // --- 步驟 2: 等待 Echo 腳位變高 (開始接收回波) ---
+//    pMillis = HAL_GetTick();
+//    while (!(HAL_GPIO_ReadPin(ECHO_PORT, ECHO_PIN))) {
+//        // 超時 10ms 未收到回波 (代表感測器沒反應)
+//        if (HAL_GetTick() - pMillis > 10) {
+//            printf("NO ECHO (Timeout waiting for HIGH) !! \r\n");
+//            return -1.0;
+//        }
+//    }
+//
+//    // 記錄 Echo 變高的時刻
+//    val1 = __HAL_TIM_GET_COUNTER(&htim2);
+//
+//    // --- 步驟 3: 等待 Echo 腳位變低 (回波結束) ---
+//    pMillis = HAL_GetTick();
+//    while ((HAL_GPIO_ReadPin(ECHO_PORT, ECHO_PIN))) {
+//        // 超時 50ms (約 8.5公尺，超出規格)
+//        // 如果卡在這裡，通常是上面步驟 0 沒過，或者感測器誤判
+//        if (HAL_GetTick() - pMillis > 50) {
+//            printf("ECHO STUCK HIGH (Timeout waiting for LOW) !! \r\n");
+//            return -2.0;
+//        }
+//    }
+//
+//    // 記錄 Echo 變低的時刻
+//    val2 = __HAL_TIM_GET_COUNTER(&htim2);
+//
+//    // --- 步驟 4: 計算 ---
+//    if (val2 >= val1) {
+//        pWidth = val2 - val1;
+//    } else {
+//        // 處理 Timer 溢位 (假設 32-bit Timer)
+//        pWidth = (0xFFFFFFFF - val1) + val2;
+//    }
+//
+//    // 距離 = 時間 * 0.034 / 2
+//    float distance = pWidth * 0.034f / 2.0f;
+//
+//    return distance;
+//}
 
-    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
-    {
-        if (capture_status == 0)
-        {
-        	printf("capture status = 0 \r\n");
-            t_start = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);   // 讀取CNT
-            // 切換為下降沿檢測
-            __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_FALLING);
-            capture_status = 1;
-        }
-        else if (capture_status == 1)
-        {
-        	printf("capture status = 1 \r\n");
-            t_end = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
-            uint32_t pulse_width_us = t_end - t_start;
+// --- [關鍵] 外部中斷回調函式 (Interrupt Callback) ---
+// 當 Echo 腳位電位發生變化時，CPU 會自動跳轉至此
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    // 立即讀取當前時間 (Timer計數值)
+    uint32_t now = __HAL_TIM_GET_COUNTER(&htim2);
 
-            // 恢復為上升沿檢測
-            __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
-            capture_status = 0;
+    Ultrasonic_t *target = NULL;
+    GPIO_TypeDef *target_port = NULL;
 
-            // 調用距離轉換函數
-            Calculate_Distance(pulse_width_us);
+    // 1. 辨識是哪一個感測器觸發中斷
+    if (GPIO_Pin == L_ECHO_PIN) {
+        target = &us_L;
+        target_port = L_ECHO_PORT;
+    }
+    else if (GPIO_Pin == C_ECHO_PIN) {
+        target = &us_C;
+        target_port = C_ECHO_PORT;
+    }
+    else if (GPIO_Pin == R_ECHO_PIN) {
+        target = &us_R;
+        target_port = R_ECHO_PORT;
+    }
+
+    // 2. 處理時間記錄
+    if (target != NULL) {
+        // 讀取該腳位目前的電位狀態
+        if (HAL_GPIO_ReadPin(target_port, GPIO_Pin) == GPIO_PIN_SET) {
+            // [上升緣 RISING]: 回波開始
+            target->start_tick = now;
+            target->is_measuring = true;
+        } else {
+            // [下降緣 FALLING]: 回波結束
+            if (target->is_measuring) {
+                target->end_tick = now;
+                target->is_measuring = false;
+
+                // 計算脈衝寬度 (處理 Timer 溢位狀況)
+                uint32_t duration;
+                if (target->end_tick >= target->start_tick) {
+                    duration = target->end_tick - target->start_tick;
+                } else {
+                    // 若 Timer 在測量期間溢位 (0xFFFFFFFF -> 0)
+                    duration = (0xFFFFFFFF - target->start_tick) + target->end_tick;
+                }
+
+                // 計算距離: 距離(cm) = 時間(us) * 0.034 / 2
+                // 簡化計算: duration * 0.017
+                target->distance = (float)duration * 0.017f;
+                target->valid = 1; // 標記數據有效
+            }
         }
     }
 }
-void DWT_Init(void)
-{
-    // 啟動 DWT trace unit
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
 
-    // Reset counter
-    DWT->CYCCNT = 0;
+// --- [任務] 超音波排程器 (Scheduler Task) ---
+// 負責輪詢三個感測器，並處理超時。請在主迴圈中持續呼叫。
+void Task_Ultrasonic_Update(void) {
+    uint32_t current_time = HAL_GetTick(); // 取得系統毫秒 (ms)
 
-    // Enable CYCCNT
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    switch (measure_step) {
+        case 0: // [準備/發射階段] Trigger
+            // 每次測量間隔 30ms，避免上一輪的聲波殘留干擾
+            if (current_time - last_process_tick > 10) {
+
+                // 根據當前索引觸發對應的感測器
+                if (current_sensor_idx == 0) US_Trigger(L_TRIG_PORT, L_TRIG_PIN);
+                else if (current_sensor_idx == 1) US_Trigger(C_TRIG_PORT, C_TRIG_PIN);
+                else if (current_sensor_idx == 2) US_Trigger(R_TRIG_PORT, R_TRIG_PIN);
+
+                // 將該感測器的數據標記為「更新中/無效」
+                if(current_sensor_idx == 0) us_L.valid = 0;
+                else if(current_sensor_idx == 1) us_C.valid = 0;
+                else if(current_sensor_idx == 2) us_R.valid = 0;
+
+                measure_step = 1; // 進入等待階段
+                last_process_tick = current_time;
+            }
+            break;
+
+        case 1: // [等待階段] Wait for Echo
+            // 檢查中斷是否已經完成測量 (valid變為1)
+            bool done = false;
+            if (current_sensor_idx == 0 && us_L.valid) done = true;
+            else if (current_sensor_idx == 1 && us_C.valid) done = true;
+            else if (current_sensor_idx == 2 && us_R.valid) done = true;
+
+            if (done) {
+                measure_step = 2; // 收到回波，準備換下一個
+            }
+            else if (current_time - last_process_tick > 20) {
+                // [超時處理]
+                // 如果過了 35ms 還沒收到完整回波 (約 6公尺距離)
+                // 強制結束等待，標示為 999 (代表無限遠或遺失)
+                if(current_sensor_idx == 0) us_L.distance = 999.0;
+                else if(current_sensor_idx == 1) us_C.distance = 999.0;
+                else if(current_sensor_idx == 2) us_R.distance = 999.0;
+
+                measure_step = 2; // 強制進下一階段
+            }
+            break;
+
+        case 2: // [切換階段] Next Sensor
+            // 切換索引: 0->1->2->0
+            current_sensor_idx++;
+            if (current_sensor_idx > 2) current_sensor_idx = 0;
+
+            measure_step = 0; // 回到發射狀態
+            // 注意：這裡不更新 last_process_tick，利用 case 0 的檢查來產生間隔
+            break;
+    }
+}
+
+void Task_Movement_Logic(void) {
+    static uint32_t logic_timer = 0;
+    // 每 200ms 進行一次判斷，避免數值跳動太快看不清
+    if (HAL_GetTick() - logic_timer < 400) return;
+    logic_timer = HAL_GetTick();
+
+    // 1. 找出最近的物體距離與位置 (Filter Logic)
+    float dL = us_L.distance;
+    float dC = us_C.distance;
+    float dR = us_R.distance;
+
+    // 過濾無效值 (0 或 999)
+    if (dL <= 0) dL = 999;
+    if (dC <= 0) dC = 999;
+    if (dR <= 0) dR = 999;
+
+    float min_dist = 999.0f;
+    Zone_t detected_zone = ZONE_NONE;
+
+    // 簡單的最小值比較，找出物體主要在哪一區
+    if (dL < DETECT_THRESHOLD) { min_dist = dL; detected_zone = ZONE_LEFT; }
+    if (dC < DETECT_THRESHOLD && dC < min_dist) { min_dist = dC; detected_zone = ZONE_CENTER; }
+    if (dR < DETECT_THRESHOLD && dR < min_dist) { min_dist = dR; detected_zone = ZONE_RIGHT; }
+
+    // 2. 判斷移動方向 (Movement Analysis)
+    char status_msg[64] = "Waiting...";
+
+    if (detected_zone == ZONE_NONE) {
+        sprintf(status_msg, "No Target");
+        last_zone = ZONE_NONE; // 重置狀態
+    }
+    else {
+        // --- 橫向移動判斷 (Left <-> Right) ---
+        if (last_zone != ZONE_NONE && last_zone != detected_zone) {
+            if (last_zone == ZONE_LEFT && detected_zone == ZONE_CENTER) sprintf(status_msg, "Moving RIGHT (L->C) >>>");
+            else if (last_zone == ZONE_CENTER && detected_zone == ZONE_RIGHT) sprintf(status_msg, "Moving RIGHT (C->R) >>>");
+            else if (last_zone == ZONE_RIGHT && detected_zone == ZONE_CENTER) sprintf(status_msg, "Moving LEFT (R->C) <<<");
+            else if (last_zone == ZONE_CENTER && detected_zone == ZONE_LEFT) sprintf(status_msg, "Moving LEFT (C->L) <<<");
+            else sprintf(status_msg, "Position Changed"); // 例如直接從 L 跳到 R (速度很快)
+        }
+        // --- 徑向移動判斷 (靠近/遠離) ---
+        else if (last_zone == detected_zone) {
+            float diff = min_dist - last_min_distance;
+
+            if (diff < -MOVE_HYSTERESIS) sprintf(status_msg, "Approaching (%.0fcm)", min_dist);
+            else if (diff > MOVE_HYSTERESIS) sprintf(status_msg, "Leaving (%.0fcm)", min_dist);
+            else {
+                 // 靜止狀態或變化不大
+                 if(detected_zone == ZONE_LEFT) sprintf(status_msg, "Stationary [LEFT]");
+                 else if(detected_zone == ZONE_CENTER) sprintf(status_msg, "Stationary [CENTER]");
+                 else if(detected_zone == ZONE_RIGHT) sprintf(status_msg, "Stationary [RIGHT]");
+            }
+        }
+        else {
+             // 剛偵測到目標的第一個瞬間
+             sprintf(status_msg, "Target Detected!");
+        }
+
+        // 更新歷史狀態
+        last_zone = detected_zone;
+        last_min_distance = min_dist;
+    }
+
+    // 3. 輸出結果
+    printf("[L:%3.0f C:%3.0f R:%3.0f] -> %s\r\n", dL, dC, dR, status_msg);
 }
 
 /* USER CODE END PFP */
@@ -170,6 +404,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -199,52 +434,35 @@ int main(void)
   MX_USB_OTG_FS_PCD_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_IC_Start_IT(&htim2,TIM_CHANNEL_1);
-  printf("capture status = %d \r\n",capture_status);
+  HAL_TIM_Base_Start(&htim2);
+  printf("\r\n=== STM32 3-Way Ultrasonic System (Non-Blocking) ===\r\n");
+  printf("Configuration Checked:\r\n");
+  printf("  [L] Trig:PD14, Echo:PB0\r\n");
+  printf("  [C] Trig:PA3,  Echo:PB4\r\n");
+  printf("  [R] Trig:PB1,  Echo:PB2\r\n");
+  printf("System Started.\r\n");
   /* USER CODE END 2 */
-
-  /* Init scheduler */
-  osKernelInitialize();
-
-  /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
-  /* USER CODE END RTOS_MUTEX */
-
-  /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* add semaphores, ... */
-  /* USER CODE END RTOS_SEMAPHORES */
-
-  /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
-  /* USER CODE END RTOS_TIMERS */
-
-  /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
-  /* USER CODE END RTOS_QUEUES */
-
-  /* Create the thread(s) */
-  /* creation of defaultTask */
-  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
-
-  /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
-  /* USER CODE END RTOS_THREADS */
-
-  /* USER CODE BEGIN RTOS_EVENTS */
-  /* add events, ... */
-  /* USER CODE END RTOS_EVENTS */
-
-  /* Start scheduler */
-  osKernelStart();
-
-  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
     /* USER CODE END WHILE */
-
+	Task_Ultrasonic_Update();
+	// --- 應用任務：每 200ms 顯示一次結果 ---
+	Task_Movement_Logic();
+//	static uint32_t print_timer = 0;
+//	if (HAL_GetTick() - print_timer > 200) {
+//		printf("L:%5.1f | C:%5.1f | R:%5.1f (cm)", us_L.distance, us_C.distance, us_R.distance);
+//
+//		// 簡單的測試邏輯: 顯示目標方向
+//		if (us_C.distance > 0 && us_C.distance < 30) printf("  [Target Center]");
+//		else if (us_L.distance > 0 && us_L.distance < 30) printf("  [Target Left]");
+//		else if (us_R.distance > 0 && us_R.distance < 30) printf("  [Target Right]");
+//
+//		printf("\r\n");
+//		print_timer = HAL_GetTick();
+//	}
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -364,7 +582,7 @@ static void MX_I2C2_Init(void)
 
   /* USER CODE END I2C2_Init 1 */
   hi2c2.Instance = I2C2;
-  hi2c2.Init.Timing = 0x00000E14;
+  hi2c2.Init.Timing = 0x10D19CE4;
   hi2c2.Init.OwnAddress1 = 0;
   hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -483,7 +701,6 @@ static void MX_TIM2_Init(void)
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_IC_InitTypeDef sConfigIC = {0};
 
   /* USER CODE BEGIN TIM2_Init 1 */
 
@@ -503,21 +720,9 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_TIM_IC_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
-  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
-  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
-  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -655,14 +860,14 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOE, M24SR64_Y_RF_DISABLE_Pin|M24SR64_Y_GPO_Pin|ISM43362_RST_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1|ARD_D10_Pin|SPBTLE_RF_RST_Pin|ARD_D9_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, ARD_D10_Pin|C_TRIG_Pin|SPBTLE_RF_RST_Pin|ARD_D9_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|ARD_D8_Pin|ISM43362_BOOT0_Pin|ISM43362_WAKEUP_Pin
-                          |LED2_Pin|SPSGRF_915_SDN_Pin|ARD_D5_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, R_TRIG_Pin|ISM43362_BOOT0_Pin|ISM43362_WAKEUP_Pin|LED2_Pin
+                          |SPSGRF_915_SDN_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, USB_OTG_FS_PWR_EN_Pin|PMOD_RESET_Pin|STSAFE_A100_RESET_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOD, USB_OTG_FS_PWR_EN_Pin|L_TRIG_Pin|PMOD_RESET_Pin|STSAFE_A100_RESET_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(SPBTLE_RF_SPI3_CSN_GPIO_Port, SPBTLE_RF_SPI3_CSN_Pin, GPIO_PIN_SET);
@@ -703,8 +908,16 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PA1 ARD_D10_Pin SPBTLE_RF_RST_Pin ARD_D9_Pin */
-  GPIO_InitStruct.Pin = GPIO_PIN_1|ARD_D10_Pin|SPBTLE_RF_RST_Pin|ARD_D9_Pin;
+  /*Configure GPIO pins : ARD_D1_Pin ARD_D0_Pin */
+  GPIO_InitStruct.Pin = ARD_D1_Pin|ARD_D0_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF8_UART4;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : ARD_D10_Pin C_TRIG_Pin SPBTLE_RF_RST_Pin ARD_D9_Pin */
+  GPIO_InitStruct.Pin = ARD_D10_Pin|C_TRIG_Pin|SPBTLE_RF_RST_Pin|ARD_D9_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -724,31 +937,31 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PB0 ARD_D8_Pin ISM43362_BOOT0_Pin ISM43362_WAKEUP_Pin
-                           LED2_Pin SPSGRF_915_SDN_Pin ARD_D5_Pin SPSGRF_915_SPI3_CSN_Pin */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|ARD_D8_Pin|ISM43362_BOOT0_Pin|ISM43362_WAKEUP_Pin
-                          |LED2_Pin|SPSGRF_915_SDN_Pin|ARD_D5_Pin|SPSGRF_915_SPI3_CSN_Pin;
+  /*Configure GPIO pins : L_ECHO_Pin R_ECHO_Pin C_ECHO_Pin */
+  GPIO_InitStruct.Pin = L_ECHO_Pin|R_ECHO_Pin|C_ECHO_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : R_TRIG_Pin ISM43362_BOOT0_Pin ISM43362_WAKEUP_Pin LED2_Pin
+                           SPSGRF_915_SDN_Pin SPSGRF_915_SPI3_CSN_Pin */
+  GPIO_InitStruct.Pin = R_TRIG_Pin|ISM43362_BOOT0_Pin|ISM43362_WAKEUP_Pin|LED2_Pin
+                          |SPSGRF_915_SDN_Pin|SPSGRF_915_SPI3_CSN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : ARD_D6_Pin */
-  GPIO_InitStruct.Pin = ARD_D6_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG_ADC_CONTROL;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(ARD_D6_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : LPS22HB_INT_DRDY_EXTI0_Pin LSM6DSL_INT1_EXTI11_Pin ARD_D2_Pin HTS221_DRDY_EXTI15_Pin
-                           PMOD_IRQ_EXTI12_Pin */
-  GPIO_InitStruct.Pin = LPS22HB_INT_DRDY_EXTI0_Pin|LSM6DSL_INT1_EXTI11_Pin|ARD_D2_Pin|HTS221_DRDY_EXTI15_Pin
-                          |PMOD_IRQ_EXTI12_Pin;
+  /*Configure GPIO pins : LPS22HB_INT_DRDY_EXTI0_Pin LSM6DSL_INT1_EXTI11_Pin HTS221_DRDY_EXTI15_Pin */
+  GPIO_InitStruct.Pin = LPS22HB_INT_DRDY_EXTI0_Pin|LSM6DSL_INT1_EXTI11_Pin|HTS221_DRDY_EXTI15_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : USB_OTG_FS_PWR_EN_Pin SPBTLE_RF_SPI3_CSN_Pin PMOD_RESET_Pin STSAFE_A100_RESET_Pin */
-  GPIO_InitStruct.Pin = USB_OTG_FS_PWR_EN_Pin|SPBTLE_RF_SPI3_CSN_Pin|PMOD_RESET_Pin|STSAFE_A100_RESET_Pin;
+  /*Configure GPIO pins : USB_OTG_FS_PWR_EN_Pin SPBTLE_RF_SPI3_CSN_Pin L_TRIG_Pin PMOD_RESET_Pin
+                           STSAFE_A100_RESET_Pin */
+  GPIO_InitStruct.Pin = USB_OTG_FS_PWR_EN_Pin|SPBTLE_RF_SPI3_CSN_Pin|L_TRIG_Pin|PMOD_RESET_Pin
+                          |STSAFE_A100_RESET_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -792,10 +1005,19 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI2_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
-  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -806,25 +1028,6 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /* USER CODE END 4 */
-
-/* USER CODE BEGIN Header_StartDefaultTask */
-/**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void *argument)
-{
-  /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
-  {
-	HC_SR04_Trigger();       // 觸發一次
-    osDelay(10);
-  }
-  /* USER CODE END 5 */
-}
 
 /**
   * @brief  This function is executed in case of error occurrence.
