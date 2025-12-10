@@ -1,0 +1,25 @@
+# STM32CubeIDE / Eclipse specific
+Debug/
+Release/
+.settings/
+*.launch
+
+# Keil MDK-ARM specific (如果用 Keil)
+*.uvoptx
+*.uvguix.*
+RTE/
+Listings/
+Objects/
+
+# Compilation output
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+
+# OS specific
+.DS_Store
+Thumbs.db

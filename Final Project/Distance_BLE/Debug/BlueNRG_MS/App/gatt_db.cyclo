@@ -1,0 +1,9 @@
+../BlueNRG_MS/App/gatt_db.c:89:12:Add_Sentry_Service	4
+../BlueNRG_MS/App/gatt_db.c:130:12:Add_HWServW2ST_Service	4
+../BlueNRG_MS/App/gatt_db.c:177:12:Add_SWServW2ST_Service	3
+../BlueNRG_MS/App/gatt_db.c:216:12:Acc_Update	2
+../BlueNRG_MS/App/gatt_db.c:250:12:Quat_Update	2
+../BlueNRG_MS/App/gatt_db.c:302:6:BLE_Send_Alert_Status	2
+../BlueNRG_MS/App/gatt_db.c:316:6:Read_Request_CB	4
+../BlueNRG_MS/App/gatt_db.c:339:6:Write_Request_CB	4
+../BlueNRG_MS/App/gatt_db.c:387:12:BlueMS_Environmental_Update	2
