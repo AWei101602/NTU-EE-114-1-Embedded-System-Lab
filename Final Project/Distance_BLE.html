@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sentry 藍牙監控控制器 v3 (穩定版)</title>
+    <style>
+        :root {
+            --primary-color: #007AFF;
+            --success-color: #34C759;
+            --danger-color: #FF3B30;
+            --warning-color: #FF9500;
+            --bg-color: #F2F2F7;
+            --card-bg: #FFFFFF;
+            --text-color: #1C1C1E;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        .container {
+            background: var(--card-bg);
+            width: 100%;
+            max-width: 400px;
+            border-radius: 20px;
+            padding: 30px 20px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.05);
+            text-align: center;
+        }
+
+        h1 {
+            margin-top: 0;
+            font-size: 1.5rem;
+            margin-bottom: 5px;
+        }
+
+        .subtitle {
+            color: #8E8E93;
+            font-size: 0.9rem;
+            margin-bottom: 25px;
+        }
+
+        /* 狀態指示燈 */
+        .status-container {
+            position: relative;
+            width: 160px;
+            height: 160px;
+            margin: 0 auto 30px auto;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .status-circle {
+            width: 140px;
+            height: 140px;
+            border-radius: 50%;
+            background-color: #E5E5EA;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            box-shadow: inset 0 5px 10px rgba(0,0,0,0.05);
+            z-index: 2;
+        }
+
+        .status-circle i {
+            font-size: 2.5rem;
+            margin-bottom: 5px;
+            font-style: normal;
+        }
+
+        .status-label {
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: #8E8E93;
+        }
+
+        /* 狀態波紋動畫 */
+        .ripple {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 140px;
+            height: 140px;
+            border-radius: 50%;
+            background-color: transparent;
+            z-index: 1;
+        }
+
+        /* 狀態樣式 */
+        .status-circle.active {
+            background-color: var(--success-color);
+            box-shadow: 0 10px 20px rgba(52, 199, 89, 0.3);
+        }
+        .status-circle.active .status-label,
+        .status-circle.active i { color: white; }
+
+        .status-circle.alert {
+            background-color: var(--danger-color);
+            box-shadow: 0 10px 20px rgba(255, 59, 48, 0.4);
+            animation: shake 0.5s ease-in-out;
+        }
+        .status-circle.alert .status-label,
+        .status-circle.alert i { color: white; }
+        
+        .status-circle.alert + .ripple {
+            animation: ripple-effect 1.5s infinite;
+            background-color: rgba(255, 59, 48, 0.3);
+        }
+
+        /* 控制面板 */
+        .control-panel {
+            background-color: #F2F2F7;
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+            color: #3A3A3C;
+        }
+        .info-value { font-weight: 600; }
+
+        /* 按鈕 */
+        .btn {
+            width: 100%;
+            padding: 16px;
+            border: none;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.1s, opacity 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        .btn:active { transform: scale(0.98); }
+        
+        .btn-primary {
+            background-color: var(--primary-color);
+            color: white;
+            box-shadow: 0 4px 10px rgba(0, 122, 255, 0.3);
+        }
+
+        .btn-toggle {
+            background-color: #D1D1D6;
+            color: #8E8E93;
+            cursor: not-allowed;
+        }
+        
+        .btn-toggle.enabled {
+            background-color: var(--success-color);
+            color: white;
+            cursor: pointer;
+            box-shadow: 0 4px 10px rgba(52, 199, 89, 0.3);
+        }
+
+        .btn-toggle.enabled.armed {
+            background-color: var(--warning-color);
+            box-shadow: 0 4px 10px rgba(255, 149, 0, 0.3);
+        }
+        
+        .mode-switch {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 15px;
+            font-size: 0.85rem;
+            color: #666;
+            gap: 8px;
+        }
+
+        .log-area {
+            font-family: monospace;
+            background: #000;
+            color: #0f0;
+            padding: 10px;
+            border-radius: 8px;
+            text-align: left;
+            font-size: 12px;
+            height: 100px;
+            overflow-y: auto;
+            margin-top: 20px;
+            display: block; /* V3 改為預設顯示，方便除錯 */
+        }
+
+        @keyframes ripple-effect {
+            0% { width: 140px; height: 140px; opacity: 0.8; }
+            100% { width: 240px; height: 240px; opacity: 0; }
+        }
+
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            25% { transform: translateX(-5px); }
+            75% { transform: translateX(5px); }
+        }
+        
+        .setup-hint {
+            font-size: 0.8rem;
+            color: #856404;
+            background-color: #fff3cd;
+            border: 1px solid #ffeeba;
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            text-align: left;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Sentry 監控中心</h1>
+    <div class="subtitle">BLE 遠端安全系統 v3 (穩定版)</div>
+
+    <!-- 提示使用者 -->
+    <div class="setup-hint" id="uuidHint">
+        <strong>⚠️ 連線失敗怎麼辦？</strong><br>
+        1. 按一下開發板的黑色 <strong>RESET</strong> 按鈕。<br>
+        2. 關閉手機上的 nRF Connect App (避免佔用)。<br>
+        3. 重新點擊下方按鈕連線。
+    </div>
+
+    <div class="status-container">
+        <div id="statusCircle" class="status-circle">
+            <i id="statusIcon">🔒</i>
+            <span id="statusText" class="status-label">待機</span>
+        </div>
+        <div class="ripple"></div>
+    </div>
+
+    <div class="control-panel">
+        <div class="info-row">
+            <span>連線狀態</span>
+            <span id="connectionState" class="info-value" style="color: #FF3B30">未連線</span>
+        </div>
+        <div class="info-row">
+            <span>系統模式</span>
+            <span id="systemMode" class="info-value">--</span>
+        </div>
+        <div class="info-row">
+            <span>感測器狀態</span>
+            <span id="sensorState" class="info-value">--</span>
+        </div>
+    </div>
+    
+    <!-- 搜尋模式選項 -->
+    <div class="mode-switch">
+        <label>
+            <input type="checkbox" id="chkShowAll"> 顯示所有裝置 (若搜不到請勾選)
+        </label>
+    </div>
+
+    <button id="btnConnect" class="btn btn-primary" style="margin-bottom: 15px;">
+        🔍 搜尋並連線
+    </button>
+
+    <button id="btnToggle" class="btn btn-toggle" disabled>
+        🛡️ 開啟警戒模式
+    </button>
+
+    <div id="logArea" class="log-area"></div>
+    <div style="margin-top:10px; font-size: 12px; color: #aaa; cursor: pointer;" onclick="toggleLog()">
+        [ 顯示/隱藏除錯日誌 ]
+    </div>
+</div>
+
+<script>
+    // =================================================================
+    // UUID 設定
+    // =================================================================
+    const SERVICE_UUID     = "1bc5d5a5-0200-b49a-e111-010000000000"; 
+    const CHAR_CTRL_UUID   = "1bc5d5a5-0200-b49a-e111-020000000000"; 
+    const CHAR_STATUS_UUID = "1bc5d5a5-0200-b49a-e111-030000000000"; 
+    
+    // 裝置名稱
+    const TARGET_DEVICE_NAME = "Sentry";
+    // =================================================================
+
+    // 變數
+    let device, server, service;
+    let ctrlChar, statusChar;
+    let isConnected = false;
+    let isArmed = false;
+
+    // UI 元素
+    const btnConnect = document.getElementById('btnConnect');
+    const btnToggle = document.getElementById('btnToggle');
+    const chkShowAll = document.getElementById('chkShowAll');
+    const statusCircle = document.getElementById('statusCircle');
+    const statusText = document.getElementById('statusText');
+    const statusIcon = document.getElementById('statusIcon');
+    const connectionState = document.getElementById('connectionState');
+    const systemMode = document.getElementById('systemMode');
+    const sensorState = document.getElementById('sensorState');
+    const logArea = document.getElementById('logArea');
+    const uuidHint = document.getElementById('uuidHint');
+
+    function log(msg) {
+        const time = new Date().toLocaleTimeString();
+        logArea.innerHTML += `[${time}] ${msg}<br>`;
+        logArea.scrollTop = logArea.scrollHeight;
+        console.log(msg);
+    }
+
+    function toggleLog() {
+        logArea.style.display = logArea.style.display === 'none' ? 'block' : 'none';
+    }
+
+    // 輔助函式：延遲
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    // 1. 連線邏輯
+    btnConnect.addEventListener('click', async () => {
+        if (isConnected) {
+            disconnect();
+            return;
+        }
+
+        try {
+            log('準備搜尋裝置...');
+            
+            let options = {
+                optionalServices: [SERVICE_UUID] 
+            };
+
+            if (chkShowAll.checked) {
+                log('使用寬鬆模式 (acceptAllDevices)');
+                options.acceptAllDevices = true;
+            } else {
+                log(`搜尋名稱: ${TARGET_DEVICE_NAME}`);
+                options.filters = [{ name: TARGET_DEVICE_NAME }];
+            }
+
+            // A. 請求裝置
+            device = await navigator.bluetooth.requestDevice(options);
+
+            device.addEventListener('gattserverdisconnected', onDisconnected);
+            
+            connectionState.innerText = "連線中...";
+            log(`選定裝置: ${device.name}`);
+
+            // B. 嘗試連線
+            log('正在建立 GATT 連線...');
+            server = await device.gatt.connect();
+            log('GATT 連線成功！');
+            
+            // 【關鍵修改】增加延遲，讓藍牙堆疊穩定下來
+            log('等待通訊穩定 (1秒)...');
+            await sleep(1000);
+
+            // C. 取得 Service
+            log('正在讀取 Service...');
+            try {
+                service = await server.getPrimaryService(SERVICE_UUID);
+                log('Service 讀取成功');
+            } catch (err) {
+                log('❌ Service 讀取失敗。可能是 UUID 不匹配或裝置忙碌。');
+                log('錯誤詳情: ' + err);
+                throw err;
+            }
+
+            // D. 取得 Characteristics
+            log('正在讀取 Characteristics...');
+            ctrlChar = await service.getCharacteristic(CHAR_CTRL_UUID);
+            statusChar = await service.getCharacteristic(CHAR_STATUS_UUID);
+            
+            // E. 訂閱 Notify
+            log('正在訂閱通知...');
+            await statusChar.startNotifications();
+            statusChar.addEventListener('characteristicvaluechanged', handleNotifications);
+            log('✅ 全部就緒！');
+
+            // 更新 UI 狀態
+            onConnected();
+
+        } catch (error) {
+            log('❌ 錯誤中止: ' + error);
+            
+            let errorMsg = error.toString();
+            if (errorMsg.includes("cancelled")) {
+                connectionState.innerText = "使用者取消";
+            } else if (errorMsg.includes("Connection failed")) {
+                alert('連線失敗！\n\n請務必按一下開發板的「RESET 按鈕」後再試一次。\n(舊的連線可能卡住了)');
+                connectionState.innerText = "連線失敗";
+            } else {
+                alert('發生錯誤:\n' + error);
+                connectionState.innerText = "連線失敗";
+            }
+            connectionState.style.color = "#FF3B30";
+        }
+    });
+
+    // 2. 處理 Notify (警報)
+    function handleNotifications(event) {
+        const value = event.target.value;
+        const alertStatus = value.getUint8(0); // 讀取第一個 byte
+
+        log(`收到 Notify: ${alertStatus}`);
+
+        if (alertStatus === 1) {
+            statusCircle.className = "status-circle alert";
+            statusText.innerText = "入侵警報";
+            statusIcon.innerText = "⚠️";
+            sensorState.innerText = "偵測到物體";
+            sensorState.style.color = "#FF3B30";
+            
+            if (navigator.vibrate) navigator.vibrate([500, 200, 500]);
+        } else {
+            if (isArmed) {
+                statusCircle.className = "status-circle active";
+                statusText.innerText = "監控中";
+                statusIcon.innerText = "🛡️";
+            } else {
+                statusCircle.className = "status-circle";
+                statusText.innerText = "待機";
+                statusIcon.innerText = "🔒";
+            }
+            sensorState.innerText = "區域安全";
+            sensorState.style.color = "#34C759";
+        }
+    }
+
+    // 3. 切換模式 (Write)
+    btnToggle.addEventListener('click', async () => {
+        if (!ctrlChar) return;
+
+        try {
+            const targetState = !isArmed;
+            const data = new Uint8Array([targetState ? 1 : 0]);
+            
+            log(`寫入模式: ${targetState ? 'ON (0x01)' : 'OFF (0x00)'}`);
+            await ctrlChar.writeValue(data);
+            
+            isArmed = targetState;
+            updateArmUI();
+
+        } catch (error) {
+            log('寫入失敗: ' + error);
+            alert('指令發送失敗，可能已斷線');
+            disconnect();
+        }
+    });
+
+    function updateArmUI() {
+        if (isArmed) {
+            btnToggle.innerHTML = "🛑 關閉警戒模式";
+            btnToggle.classList.add('armed');
+            
+            statusCircle.className = "status-circle active";
+            statusText.innerText = "監控中";
+            statusIcon.innerText = "🛡️";
+            
+            systemMode.innerText = "警戒模式 (ON)";
+            systemMode.style.color = "#FF9500";
+        } else {
+            btnToggle.innerHTML = "🛡️ 開啟警戒模式";
+            btnToggle.classList.remove('armed');
+            
+            statusCircle.className = "status-circle";
+            statusText.innerText = "待機";
+            statusIcon.innerText = "🔒";
+            
+            systemMode.innerText = "待機模式 (OFF)";
+            systemMode.style.color = "#8E8E93";
+            
+            sensorState.innerText = "--";
+            sensorState.style.color = "";
+        }
+    }
+
+    function onConnected() {
+        isConnected = true;
+        uuidHint.style.display = 'none'; 
+        connectionState.innerText = "已連線";
+        connectionState.style.color = "#34C759";
+        
+        btnConnect.innerText = "❌ 斷開連線";
+        btnConnect.classList.remove('btn-primary');
+        btnConnect.style.backgroundColor = "#E5E5EA";
+        btnConnect.style.color = "#FF3B30";
+        
+        btnToggle.disabled = false;
+        btnToggle.classList.add('enabled');
+        
+        isArmed = false;
+        updateArmUI();
+    }
+
+    function onDisconnected() {
+        log('裝置已斷線');
+        disconnect(); 
+    }
+
+    function disconnect() {
+        if (device && device.gatt.connected) {
+            device.gatt.disconnect();
+        }
+        
+        isConnected = false;
+        isArmed = false;
+        
+        connectionState.innerText = "未連線";
+        connectionState.style.color = "#FF3B30";
+        
+        btnConnect.innerText = "🔍 搜尋並連線";
+        btnConnect.classList.add('btn-primary');
+        btnConnect.style.backgroundColor = "";
+        btnConnect.style.color = "";
+        
+        btnToggle.disabled = true;
+        btnToggle.classList.remove('enabled', 'armed');
+        btnToggle.innerHTML = "🛡️ 開啟警戒模式";
+        
+        statusCircle.className = "status-circle";
+        statusText.innerText = "待機";
+        statusIcon.innerText = "🔒";
+        
+        systemMode.innerText = "--";
+        sensorState.innerText = "--";
+    }
+</script>
+
+</body>
+</html>
